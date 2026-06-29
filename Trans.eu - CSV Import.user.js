@@ -589,7 +589,7 @@
         }
 
         setStep('done');
-        setMessage('STOP. Skrypt zatrzymany. Nie wysyłam, nie publikuję i nie sprawdzam kolejnych paczek.', 'warning');
+        setMessage('STOP. Import zatrzymany.', 'warning');
         setProgressNote(currentImportTracker
             ? `STOP: przerwano po wysłaniu ${currentImportTracker.sent}/${currentImportTracker.totalTasks} paczek.`
             : 'STOP: import przerwany.');
