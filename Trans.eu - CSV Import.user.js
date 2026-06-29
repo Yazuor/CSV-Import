@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      2.6
-// @description  Otwiera własny import CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
+// @version      2.8
+// @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
 // @grant        none
 // @run-at       document-start
@@ -17,7 +17,7 @@
     const DEFAULT_CONFIG_VERSION = '2.3082.0';
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
-    const ASSISTANT_VERSION = 'v2.6';
+    const ASSISTANT_VERSION = 'v2.8';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
     const CSV_CHUNK_SIZE = 10;
@@ -74,6 +74,8 @@
     let lastEtaText = '';
     let lastQueueUiUpdateAt = 0;
     let stopImportRequested = false;
+    let currentImportTracker = null;
+    let currentImportAbortController = null;
     let lastMenuInterceptAt = 0;
 
     function openCsvImportAssistantFromMenu() {
@@ -260,10 +262,16 @@
     }
 
     async function requestJson(url, options) {
-        const response = await fetch(url, {
+        const requestOptions = {
             credentials: 'include',
             ...options
-        });
+        };
+
+        if (currentImportAbortController && !requestOptions.signal) {
+            requestOptions.signal = currentImportAbortController.signal;
+        }
+
+        const response = await fetch(url, requestOptions);
 
         const text = await response.text();
         let data = null;
@@ -293,7 +301,7 @@
         const raw = rawText ? String(rawText).slice(0, 500) : '';
 
         if (detail.includes('AWAITING_SCHEMA')) {
-            return `Trans.eu nie rozpoznał schematu CSV. Wybierz plik CSV wygenerowany do importu frachtów Trans.eu, a nie plik dla Trans Reply Assistant.`;
+            return 'Trans.eu nie rozpoznał schematu CSV. Wybierz plik CSV wygenerowany do importu frachtów Trans.eu.';
         }
 
         if (title || detail) {
@@ -556,8 +564,35 @@
         if (!busy || stopImportRequested) return;
 
         stopImportRequested = true;
-        setMessage('STOP włączony. Nie uruchamiam kolejnych paczek. Paczki już wysłane do Trans.eu dokończą się normalnie.', 'warning');
-        setProgressNote('Zatrzymuję dokładanie kolejnych paczek. Czekam na aktywne paczki.');
+
+        if (currentImportTracker) {
+            currentImportTracker.stopRequested = true;
+            currentImportTracker.stopPlannedTotal = Math.max(
+                Number(currentImportTracker.launchedRows || 0),
+                Number(currentImportTracker.ok || 0) + Number(currentImportTracker.errors || 0)
+            );
+            plannedPublicationTotal = currentImportTracker.stopPlannedTotal;
+            updateStatsValues(
+                plannedPublicationTotal,
+                currentImportTracker.ok,
+                Math.max(0, plannedPublicationTotal - currentImportTracker.ok - currentImportTracker.errors),
+                currentImportTracker.errors
+            );
+            setProgressControl(currentImportTracker.ok + currentImportTracker.errors, plannedPublicationTotal, true);
+            if (typeof currentImportTracker.resolveQueue === 'function') {
+                currentImportTracker.resolveQueue();
+            }
+        }
+
+        if (currentImportAbortController) {
+            currentImportAbortController.abort();
+        }
+
+        setStep('done');
+        setMessage('STOP. Skrypt zatrzymany. Nie wysyłam, nie publikuję i nie sprawdzam kolejnych paczek.', 'warning');
+        setProgressNote(currentImportTracker
+            ? `STOP: przerwano po wysłaniu ${currentImportTracker.sent}/${currentImportTracker.totalTasks} paczek.`
+            : 'STOP: import przerwany.');
         updateBusy();
     }
 
@@ -576,6 +611,9 @@
             done: 0,
             ok: 0,
             errors: 0,
+            launchedRows: 0,
+            stopRequested: false,
+            stopPlannedTotal: 0,
             remaining: plannedTotal,
             states: new Map()
         };
@@ -597,7 +635,9 @@
             errors += Number(item.summary.errors || 0);
         });
 
-        const totalRows = tracker.plannedTotal;
+        const totalRows = tracker.stopRequested
+            ? Math.max(Number(tracker.stopPlannedTotal || 0), Number(tracker.launchedRows || 0), ok + errors)
+            : tracker.plannedTotal;
         const remaining = Math.max(0, totalRows - ok - errors);
         const eta = estimateRemainingTime(ok + errors, totalRows, tracker.publicationStartedAt);
         const now = Date.now();
@@ -605,11 +645,21 @@
         tracker.ok = ok;
         tracker.errors = errors;
         tracker.remaining = remaining;
+        if (tracker.stopRequested) {
+            tracker.stopPlannedTotal = totalRows;
+            plannedPublicationTotal = totalRows;
+            return;
+        }
         updateStatsValues(totalRows, ok, remaining, errors);
 
         if (forceUi || !lastQueueUiUpdateAt || now - lastQueueUiUpdateAt >= IMPORT_QUEUE_UI_REFRESH_MS) {
-            setMessage(`Łącznie opublikowano ${ok} z ${totalRows}. Pozostało: ${remaining}. Szacunkowy czas do końca: ${eta}.`, 'info');
-            setProgressNote(`Wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.totalTasks}.`);
+            if (tracker.stopRequested) {
+                setMessage(`STOP aktywny. Kończę tylko wysłane paczki. Opublikowano ${ok} z ${totalRows}. Pozostało w aktywnych paczkach: ${remaining}.`, 'warning');
+                setProgressNote(`STOP: wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.sent}.`);
+            } else {
+                setMessage(`Łącznie opublikowano ${ok} z ${totalRows}. Pozostało: ${remaining}. Szacunkowy czas do końca: ${eta}.`, 'info');
+                setProgressNote(`Wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.totalTasks}.`);
+            }
             lastQueueUiUpdateAt = now;
         }
     }
@@ -788,6 +838,14 @@
         let lastGoodState = null;
 
         while (true) {
+            if (stopImportRequested || tracker.stopRequested) {
+                return {
+                    stopped: true,
+                    data: lastGoodState || {},
+                    task
+                };
+            }
+
             attempt++;
             let last = null;
 
@@ -833,11 +891,27 @@
     }
 
     async function startQueuedImportTask(task, tracker) {
+        if (stopImportRequested || tracker.stopRequested) {
+            return {
+                stopped: true,
+                data: {},
+                task
+            };
+        }
+
         setProgressNote(`Wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Kolejne startują po zwolnieniu miejsca.`);
 
         const upload = await uploadCsv(task.chunk.file);
         const importUuid = upload && upload.import && upload.import.uuid;
         const employeeId = upload && upload.import && upload.import.employee_id;
+
+        if (stopImportRequested || tracker.stopRequested) {
+            return {
+                stopped: true,
+                data: upload || {},
+                task
+            };
+        }
 
         if (!importUuid) {
             throw new Error('Trans.eu przyjął plik, ale nie zwrócił identyfikatora importu.');
@@ -851,6 +925,15 @@
         }
 
         const published = await publishImport(importUuid, employeeId);
+
+        if (stopImportRequested || tracker.stopRequested) {
+            return {
+                stopped: true,
+                data: published || {},
+                task
+            };
+        }
+
         updateImportQueueTracker(tracker, task, published, false);
 
         if (hasBlockingErrors(published)) {
@@ -868,13 +951,18 @@
         let scheduling = false;
 
         return new Promise(resolve => {
+            tracker.resolveQueue = () => {
+                if (resolved) return true;
+                resolved = true;
+                resolve(results);
+                return true;
+            };
+
             const finishIfDone = () => {
                 if (resolved) return true;
 
-                if (results.length >= tasks.length || (stopImportRequested && active <= 0)) {
-                    resolved = true;
-                    resolve(results);
-                    return true;
+                if (results.length >= tasks.length || stopImportRequested) {
+                    return tracker.resolveQueue();
                 }
 
                 return false;
@@ -889,6 +977,7 @@
                         const task = tasks[nextIndex++];
                         active++;
                         tracker.sent++;
+                        tracker.launchedRows += Number(task.chunk && task.chunk.rows ? task.chunk.rows : CSV_CHUNK_SIZE);
 
                         setProgressNote(`Wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Aktywne: ${active}/${IMPORT_QUEUE_MAX_ACTIVE}. Zakończono ${tracker.done}/${tracker.totalTasks}.`);
 
@@ -952,6 +1041,7 @@
         busy = true;
         stopImportRequested = false;
         lastQueueUiUpdateAt = 0;
+        currentImportAbortController = new AbortController();
         updateBusy();
 
         const duplicateCount = readDuplicateCount();
@@ -1024,12 +1114,23 @@
             }
 
             const tracker = createImportQueueTracker(tasks.length, plannedPublicationTotal, publicationStartedAt, runCount, chunkPlan.rowCount);
+            currentImportTracker = tracker;
 
             setStep('publish');
             setMessage(`Startuję import. Paczki po maks. ${CSV_CHUNK_SIZE} ofert, równolegle do ${IMPORT_QUEUE_MAX_ACTIVE} paczek.`, 'info');
             setProgressNote(`Docelowo: ${plannedPublicationTotal} publikacji. ${duplicateText(duplicateCount)}.`);
 
             const results = await runLimitedImportTasks(tasks, tracker);
+
+            if (stopImportRequested) {
+                const attemptedTotal = Math.max(Number(tracker.launchedRows || 0), tracker.ok + tracker.errors);
+                plannedPublicationTotal = attemptedTotal;
+                updateStatsValues(plannedPublicationTotal, tracker.ok, 0, tracker.errors);
+                setStep('done');
+                setMessage(`STOP. Skrypt zatrzymany. Przerwano po wysłaniu ${tracker.sent}/${tasks.length} paczek.`, 'warning');
+                setProgressNote('Nie wysyłam, nie publikuję i nie sprawdzam kolejnych paczek.');
+                return;
+            }
 
             for (const item of results) {
                 if (!item.ok) continue;
@@ -1053,11 +1154,11 @@
             }
 
             if (stopImportRequested && results.length < tasks.length) {
-                const attemptedTotal = Math.max(totals.total, totals.ok + totals.errors);
+                const attemptedTotal = Math.max(Number(tracker.launchedRows || 0), totals.total, totals.ok + totals.errors);
                 plannedPublicationTotal = attemptedTotal;
                 updateStatsValues(plannedPublicationTotal, totals.ok, 0, totals.errors);
                 setStep('done');
-                setMessage(`STOP. Opublikowano ${totals.ok} frachtów. Zatrzymano przed wysłaniem kolejnych paczek. Czas pracy ${formatDuration(Date.now() - publicationStartedAt)}.`, 'warning');
+                setMessage(`STOP. Opublikowano ${totals.ok} frachtów z ${attemptedTotal} wysłanych. Zatrzymano przed wysłaniem kolejnych paczek. Czas pracy ${formatDuration(Date.now() - publicationStartedAt)}.`, 'warning');
                 setProgressNote(`Możesz zamknąć okno importu. Wysłano ${results.length}/${tasks.length} paczek.`);
                 return;
             }
@@ -1070,6 +1171,8 @@
             setMessage(error.message || String(error), 'error');
         } finally {
             busy = false;
+            currentImportTracker = null;
+            currentImportAbortController = null;
             updateBusy();
             setProgressControl(0, 0, false);
         }
