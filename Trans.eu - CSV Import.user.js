@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      2.8
+// @version      3.2
 // @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
 // @grant        none
@@ -17,9 +17,11 @@
     const DEFAULT_CONFIG_VERSION = '2.3082.0';
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
-    const ASSISTANT_VERSION = 'v2.8';
+    const ASSISTANT_VERSION = 'v3.2';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
+    const DEFAULT_DUPLICATE_DELAY_INDEX = 0;
+    const DUPLICATE_DELAY_MINUTES = [0, 1, 5, 10, 15, 30, 60];
     const CSV_CHUNK_SIZE = 10;
     const IMPORT_SAFETY_LIMIT = 400;
     const ETA_REFRESH_MS = 5000;
@@ -176,6 +178,39 @@
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function sleepOrStop(ms) {
+        if (ms <= 0 || stopImportRequested) return Promise.resolve();
+
+        return new Promise(resolve => {
+            let timeoutId = null;
+
+            const done = () => {
+                if (timeoutId) clearTimeout(timeoutId);
+                if (currentImportAbortController) {
+                    currentImportAbortController.signal.removeEventListener('abort', done);
+                }
+                resolve();
+            };
+
+            timeoutId = setTimeout(done, ms);
+
+            if (currentImportAbortController) {
+                currentImportAbortController.signal.addEventListener('abort', done, { once: true });
+            }
+        });
+    }
+
+    async function waitForDuplicateBatch(task, tracker) {
+        let remaining = Math.max(0, Number(task.availableAt || 0) - Date.now());
+
+        while (remaining > 0 && !stopImportRequested) {
+            setMessage(`Import nie jest zawieszony. Czekam ${formatDuration(remaining)} przed kolejną serią duplikatów.`, 'info');
+            setProgressNote(`Następny start: import ${task.runIndex}/${task.runCount}. Wysłano ${tracker.sent}/${tracker.totalTasks} paczek.`);
+            await sleepOrStop(Math.min(remaining, 5000));
+            remaining = Math.max(0, Number(task.availableAt || 0) - Date.now());
+        }
     }
 
     function captureHeader(key, value) {
@@ -556,6 +591,22 @@
         return Math.max(0, Math.min(MAX_DUPLICATE_COUNT, parsed || DEFAULT_DUPLICATE_COUNT));
     }
 
+    function readDuplicateDelayIndex() {
+        const input = document.getElementById('tcia-delay-count');
+        const raw = input ? Number(input.value) : DEFAULT_DUPLICATE_DELAY_INDEX;
+        const parsed = Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_DUPLICATE_DELAY_INDEX;
+
+        return Math.max(0, Math.min(DUPLICATE_DELAY_MINUTES.length - 1, parsed || DEFAULT_DUPLICATE_DELAY_INDEX));
+    }
+
+    function readDuplicateDelayMinutes() {
+        return DUPLICATE_DELAY_MINUTES[readDuplicateDelayIndex()] || 0;
+    }
+
+    function formatDuplicateDelay(minutes) {
+        return `${Number(minutes || 0)} min`;
+    }
+
     function duplicateText(count) {
         return Number(count || 0) === 1 ? '1 duplikat' : `${Number(count || 0)} duplikatów`;
     }
@@ -654,11 +705,11 @@
 
         if (forceUi || !lastQueueUiUpdateAt || now - lastQueueUiUpdateAt >= IMPORT_QUEUE_UI_REFRESH_MS) {
             if (tracker.stopRequested) {
-                setMessage(`STOP aktywny. Kończę tylko wysłane paczki. Opublikowano ${ok} z ${totalRows}. Pozostało w aktywnych paczkach: ${remaining}.`, 'warning');
-                setProgressNote(`STOP: wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.sent}.`);
+                setMessage(`STOP aktywny. Kończę tylko wysłane paczki. Opublikowano ${ok} z ${totalRows}. Pozostało w aktywnych paczkach: ${remaining}.\nWysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.sent}.`, 'warning');
+                setProgressNote('');
             } else {
-                setMessage(`Łącznie opublikowano ${ok} z ${totalRows}. Pozostało: ${remaining}. Szacunkowy czas do końca: ${eta}.`, 'info');
-                setProgressNote(`Wysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.totalTasks}.`);
+                setMessage(`Łącznie opublikowano ${ok} z ${totalRows}. Pozostało: ${remaining}. Szacunkowy czas do końca: ${eta}.\nWysłano ${tracker.sent}/${tracker.totalTasks} paczek. Zakończono ${tracker.done}/${tracker.totalTasks}.`, 'info');
+                setProgressNote('');
             }
             lastQueueUiUpdateAt = now;
         }
@@ -975,6 +1026,13 @@
                 try {
                     while (!stopImportRequested && active < IMPORT_QUEUE_MAX_ACTIVE && nextIndex < tasks.length) {
                         const task = tasks[nextIndex++];
+                        const waitMs = Math.max(0, Number(task.availableAt || 0) - Date.now());
+
+                        if (waitMs > 0) {
+                            await waitForDuplicateBatch(task, tracker);
+                            if (stopImportRequested) break;
+                        }
+
                         active++;
                         tracker.sent++;
                         tracker.launchedRows += Number(task.chunk && task.chunk.rows ? task.chunk.rows : CSV_CHUNK_SIZE);
@@ -1045,6 +1103,8 @@
         updateBusy();
 
         const duplicateCount = readDuplicateCount();
+        const duplicateDelayMinutes = readDuplicateDelayMinutes();
+        const duplicateDelayMs = duplicateDelayMinutes * 60 * 1000;
         const totals = emptyImportTotals();
         const publicationStartedAt = Date.now();
         plannedPublicationTotal = 0;
@@ -1108,7 +1168,9 @@
                         chunkCount: chunkPlan.chunks.length,
                         baseRowCount: chunkPlan.rowCount,
                         runOffset,
-                        publicationStartedAt
+                        publicationStartedAt,
+                        availableAt: publicationStartedAt + ((runIndex - 1) * duplicateDelayMs),
+                        duplicateDelayMinutes
                     });
                 }
             }
@@ -1118,7 +1180,7 @@
 
             setStep('publish');
             setMessage(`Startuję import. Paczki po maks. ${CSV_CHUNK_SIZE} ofert, równolegle do ${IMPORT_QUEUE_MAX_ACTIVE} paczek.`, 'info');
-            setProgressNote(`Docelowo: ${plannedPublicationTotal} publikacji. ${duplicateText(duplicateCount)}.`);
+            setProgressNote(`Docelowo: ${plannedPublicationTotal} publikacji. ${duplicateText(duplicateCount)}. Odstęp duplikatów: ${formatDuplicateDelay(duplicateDelayMinutes)}.`);
 
             const results = await runLimitedImportTasks(tasks, tracker);
 
@@ -1127,8 +1189,8 @@
                 plannedPublicationTotal = attemptedTotal;
                 updateStatsValues(plannedPublicationTotal, tracker.ok, 0, tracker.errors);
                 setStep('done');
-                setMessage(`STOP. Skrypt zatrzymany. Przerwano po wysłaniu ${tracker.sent}/${tasks.length} paczek.`, 'warning');
-                setProgressNote('Nie wysyłam, nie publikuję i nie sprawdzam kolejnych paczek.');
+                setMessage('STOP. Import zatrzymany.\nNie wysyłam, nie publikuję i nie sprawdzam kolejnych paczek.', 'warning');
+                setProgressNote('');
                 return;
             }
 
@@ -1158,14 +1220,14 @@
                 plannedPublicationTotal = attemptedTotal;
                 updateStatsValues(plannedPublicationTotal, totals.ok, 0, totals.errors);
                 setStep('done');
-                setMessage(`STOP. Opublikowano ${totals.ok} frachtów z ${attemptedTotal} wysłanych. Zatrzymano przed wysłaniem kolejnych paczek. Czas pracy ${formatDuration(Date.now() - publicationStartedAt)}.`, 'warning');
-                setProgressNote(`Możesz zamknąć okno importu. Wysłano ${results.length}/${tasks.length} paczek.`);
+                setMessage(`STOP. Opublikowano ${totals.ok} frachtów z ${attemptedTotal} wysłanych. Zatrzymano przed wysłaniem kolejnych paczek. Czas pracy ${formatDuration(Date.now() - publicationStartedAt)}.\nMożesz zamknąć okno importu. Wysłano ${results.length}/${tasks.length} paczek.`, 'warning');
+                setProgressNote('');
                 return;
             }
 
             setStep('done');
-            setMessage(`Gotowe. Opublikowano ${totals.ok} frachtów. Importy: ${runCount} (${duplicateText(duplicateCount)}). Czas trwania publikacji ${formatDuration(Date.now() - publicationStartedAt)}.`, 'success');
-            setProgressNote(`Możesz zamknąć okno importu. Plik miał ${chunkPlan.rowCount} ofert, łącznie przetworzono ${totals.total} wierszy.`);
+            setMessage(`Gotowe. Opublikowano ${totals.ok} frachtów. Importy: ${runCount} (${duplicateText(duplicateCount)}). Czas trwania publikacji ${formatDuration(Date.now() - publicationStartedAt)}.\nMożesz zamknąć okno importu. Plik miał ${chunkPlan.rowCount} ofert, łącznie przetworzono ${totals.total} wierszy.`, 'success');
+            setProgressNote('');
         } catch (error) {
             setStep(currentStep === 'publish' ? 'publish-error' : 'validation-error');
             setMessage(error.message || String(error), 'error');
@@ -1224,15 +1286,24 @@
                 </div>
 
                 <div class="tcia-footer">
-                    <div class="tcia-duplicate-control" id="tcia-duplicate-control">
-                        <div class="tcia-duplicate-head">
-                            <label id="tcia-repeat-label" for="tcia-repeat-count">Ilość duplikatów</label>
-                            <strong id="tcia-repeat-value">${DEFAULT_DUPLICATE_COUNT}</strong>
+                    <div class="tcia-controls">
+                        <div class="tcia-duplicate-control" id="tcia-duplicate-control">
+                            <div class="tcia-duplicate-head">
+                                <label id="tcia-repeat-label" for="tcia-repeat-count">Ilość duplikatów</label>
+                                <strong id="tcia-repeat-value">${DEFAULT_DUPLICATE_COUNT}</strong>
+                            </div>
+                            <input id="tcia-repeat-count" type="range" min="0" max="${MAX_DUPLICATE_COUNT}" step="1" value="${DEFAULT_DUPLICATE_COUNT}" />
+                            <div class="tcia-live-progress" aria-hidden="true">
+                                <span id="tcia-live-progress-bar"></span>
+                                <strong id="tcia-live-progress-text">0%</strong>
+                            </div>
                         </div>
-                        <input id="tcia-repeat-count" type="range" min="0" max="${MAX_DUPLICATE_COUNT}" step="1" value="${DEFAULT_DUPLICATE_COUNT}" />
-                        <div class="tcia-live-progress" aria-hidden="true">
-                            <span id="tcia-live-progress-bar"></span>
-                            <strong id="tcia-live-progress-text">0%</strong>
+                        <div class="tcia-duplicate-control tcia-delay-control" id="tcia-delay-control">
+                            <div class="tcia-duplicate-head">
+                                <label id="tcia-delay-label" for="tcia-delay-count">Częstotliwość duplikatów</label>
+                                <strong id="tcia-delay-value">${formatDuplicateDelay(DUPLICATE_DELAY_MINUTES[DEFAULT_DUPLICATE_DELAY_INDEX])}</strong>
+                            </div>
+                            <input id="tcia-delay-count" type="range" min="0" max="${DUPLICATE_DELAY_MINUTES.length - 1}" step="1" value="${DEFAULT_DUPLICATE_DELAY_INDEX}" />
                         </div>
                     </div>
                     <div class="tcia-actions">
@@ -1392,7 +1463,7 @@
                 color: #fff;
             }
             .tcia-body {
-                padding: 24px 42px 8px;
+                padding: 24px 42px 0;
             }
             #tcia-file {
                 position: absolute;
@@ -1501,12 +1572,24 @@
                 margin: 10px 2px 0;
                 min-height: 16px;
             }
+            .tcia-progress-note:empty {
+                display: none;
+                min-height: 0;
+                margin: 0;
+            }
             .tcia-footer {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
                 gap: 22px;
-                padding: 24px 42px 34px;
+                padding: 14px 42px 34px;
+            }
+            .tcia-controls {
+                flex: 1;
+                max-width: 390px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
             }
             .tcia-actions {
                 display: flex;
@@ -1521,6 +1604,9 @@
                 background: linear-gradient(135deg, #f5f9ff 0%, #edf6ff 100%);
                 border: 1px solid #d8e8fa;
                 box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+            }
+            .tcia-controls .tcia-duplicate-control {
+                max-width: none;
             }
             .tcia-duplicate-head {
                 display: flex;
@@ -1540,6 +1626,7 @@
                 justify-content: center;
                 min-width: 38px;
                 height: 28px;
+                box-sizing: border-box;
                 border-radius: 999px;
                 background: #1b75bb;
                 color: #fff;
@@ -1547,7 +1634,12 @@
                 font-weight: 900;
                 box-shadow: 0 6px 14px rgba(27, 117, 187, 0.22);
             }
-            #tcia-repeat-count {
+            .tcia-delay-control .tcia-duplicate-head strong {
+                min-width: 64px;
+                padding: 0 12px;
+            }
+            #tcia-repeat-count,
+            #tcia-delay-count {
                 --tcia-range-value: 0%;
                 width: 100%;
                 height: 10px;
@@ -1600,7 +1692,8 @@
             .tcia-duplicate-control.is-progress .tcia-live-progress {
                 display: block;
             }
-            #tcia-repeat-count::-webkit-slider-thumb {
+            #tcia-repeat-count::-webkit-slider-thumb,
+            #tcia-delay-count::-webkit-slider-thumb {
                 appearance: none;
                 -webkit-appearance: none;
                 width: 24px;
@@ -1610,7 +1703,8 @@
                 border: 5px solid #1b75bb;
                 box-shadow: 0 5px 14px rgba(27, 117, 187, 0.35);
             }
-            #tcia-repeat-count::-moz-range-thumb {
+            #tcia-repeat-count::-moz-range-thumb,
+            #tcia-delay-count::-moz-range-thumb {
                 width: 16px;
                 height: 16px;
                 border-radius: 50%;
@@ -1756,6 +1850,12 @@
             updateRepeatValue();
         }
 
+        const delayInput = document.getElementById('tcia-delay-count');
+        if (delayInput) {
+            delayInput.addEventListener('input', updateDuplicateDelayValue);
+            updateDuplicateDelayValue();
+        }
+
         dropzone.addEventListener('dragover', event => {
             event.preventDefault();
             dropzone.classList.add('is-dragover');
@@ -1814,7 +1914,7 @@
         const validation = await validateTransCsvFile(selectedFile);
         selectedFileValid = validation.ok;
         setMessage(validation.message, validation.ok ? 'success' : 'error');
-        setProgressNote(validation.ok ? 'Plik jest gotowy do importu.' : 'Import zatrzymany przed wysyłką do Trans.eu.');
+        setProgressNote(validation.ok ? '' : 'Import zatrzymany przed wysyłką do Trans.eu.');
     }
 
     function setFileName(text) {
@@ -1851,6 +1951,20 @@
         input.style.setProperty('--tcia-range-value', `${percent}%`);
         if (label) label.textContent = 'Ilość duplikatów';
         if (valueNode) valueNode.textContent = String(value);
+    }
+
+    function updateDuplicateDelayValue() {
+        const input = document.getElementById('tcia-delay-count');
+        const valueNode = document.getElementById('tcia-delay-value');
+        if (!input) return;
+
+        const index = readDuplicateDelayIndex();
+        const minutes = DUPLICATE_DELAY_MINUTES[index] || 0;
+        const percent = DUPLICATE_DELAY_MINUTES.length > 1 ? (index / (DUPLICATE_DELAY_MINUTES.length - 1)) * 100 : 0;
+
+        input.value = String(index);
+        input.style.setProperty('--tcia-range-value', `${percent}%`);
+        if (valueNode) valueNode.textContent = formatDuplicateDelay(minutes);
     }
 
     function setProgressControl(completed, total, active) {
@@ -1987,11 +2101,13 @@
         const stop = document.getElementById('tcia-stop');
         const file = document.getElementById('tcia-file');
         const repeat = document.getElementById('tcia-repeat-count');
+        const delay = document.getElementById('tcia-delay-count');
 
         if (run) run.disabled = busy;
         if (stop) stop.disabled = !busy || stopImportRequested;
         if (file) file.disabled = busy;
         if (repeat) repeat.disabled = busy;
+        if (delay) delay.disabled = busy;
     }
 
     hookAuthCapture();
