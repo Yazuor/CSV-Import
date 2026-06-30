@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      3.2
+// @version      3.5
 // @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
 // @grant        none
@@ -17,7 +17,7 @@
     const DEFAULT_CONFIG_VERSION = '2.3082.0';
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
-    const ASSISTANT_VERSION = 'v3.2';
+    const ASSISTANT_VERSION = 'v3.5';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
     const DEFAULT_DUPLICATE_DELAY_INDEX = 0;
@@ -629,7 +629,7 @@
                 Math.max(0, plannedPublicationTotal - currentImportTracker.ok - currentImportTracker.errors),
                 currentImportTracker.errors
             );
-            setProgressControl(currentImportTracker.ok + currentImportTracker.errors, plannedPublicationTotal, true);
+            setProgressControl(currentImportTracker.ok, plannedPublicationTotal, true);
             if (typeof currentImportTracker.resolveQueue === 'function') {
                 currentImportTracker.resolveQueue();
             }
@@ -689,8 +689,8 @@
         const totalRows = tracker.stopRequested
             ? Math.max(Number(tracker.stopPlannedTotal || 0), Number(tracker.launchedRows || 0), ok + errors)
             : tracker.plannedTotal;
-        const remaining = Math.max(0, totalRows - ok - errors);
-        const eta = estimateRemainingTime(ok + errors, totalRows, tracker.publicationStartedAt);
+        const remaining = Math.max(0, totalRows - ok);
+        const eta = estimateRemainingTime(ok, totalRows, tracker.publicationStartedAt);
         const now = Date.now();
 
         tracker.ok = ok;
@@ -765,6 +765,16 @@
         if (problem) text += `\n${problem}`;
 
         return text;
+    }
+
+    function taskLabel(task) {
+        if (!task) return 'paczka';
+
+        const importText = Number(task.runCount || 0) > 1
+            ? `import ${task.runIndex}/${task.runCount}, `
+            : '';
+
+        return `${importText}paczka ${task.chunkIndex}/${task.chunkCount}`;
     }
 
     function formatDuration(milliseconds) {
@@ -972,7 +982,10 @@
         updateImportQueueTracker(tracker, task, upload, false);
 
         if (hasBlockingErrors(upload)) {
-            throw new Error(`Trans.eu znalazł błędy w paczce ${task.chunkIndex}/${task.chunkCount}.\n${conciseStatus(upload)}`);
+            console.info('[Trans CSV Import Assistant] Upload returned warnings/errors, continuing to publish with duplicates enabled.', {
+                task,
+                status: conciseStatus(upload)
+            });
         }
 
         const published = await publishImport(importUuid, employeeId);
@@ -988,7 +1001,7 @@
         updateImportQueueTracker(tracker, task, published, false);
 
         if (hasBlockingErrors(published)) {
-            throw new Error(`Publikacja paczki ${task.chunkIndex}/${task.chunkCount} zakończona błędem.\n${conciseStatus(published)}`);
+            throw new Error(`Publikacja zakończona błędem: ${taskLabel(task)}.\n${conciseStatus(published)}`);
         }
 
         return pollQueuedImport(importUuid, task, tracker);
@@ -1567,6 +1580,7 @@
                 border: 1px solid #f2b8b5;
             }
             .tcia-progress-note {
+                display: none;
                 color: #73849b;
                 font-size: 12px;
                 margin: 10px 2px 0;
@@ -1728,7 +1742,7 @@
                 padding-right: 14px;
                 background: linear-gradient(135deg, #d84a3a, #a92d24);
                 color: #fff;
-                box-shadow: 0 10px 22px rgba(194, 47, 36, 0.22);
+                box-shadow: none;
             }
             .tcia-stop:hover:not(:disabled) {
                 background: linear-gradient(135deg, #ef5b49, #b9342b);
@@ -1933,7 +1947,7 @@
 
     function setProgressNote(text) {
         const node = document.getElementById('tcia-progress-note');
-        if (node) node.textContent = text || '';
+        if (node) node.textContent = '';
     }
 
     function updateRepeatValue() {
@@ -2080,7 +2094,7 @@
         const safeErrors = Number(errors || 0);
         const visibleTotal = plannedPublicationTotal > 0 ? plannedPublicationTotal : Number(total || 0);
         const visibleProcessing = plannedPublicationTotal > 0
-            ? Math.max(0, visibleTotal - safeOk - safeErrors)
+            ? Math.max(0, visibleTotal - safeOk)
             : Number(processing || 0);
 
         setStat('tcia-stat-total', visibleTotal);
@@ -2088,7 +2102,7 @@
         setStat('tcia-stat-processing', visibleProcessing);
         setStat('tcia-stat-errors', safeErrors);
         updateMiniProgress(visibleTotal, safeOk, visibleProcessing, safeErrors);
-        if (busy && visibleTotal > 0) setProgressControl(safeOk + safeErrors, visibleTotal, true);
+        if (busy && visibleTotal > 0) setProgressControl(safeOk, visibleTotal, true);
     }
 
     function setStat(id, value) {
