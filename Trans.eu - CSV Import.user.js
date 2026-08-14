@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      3.5
+// @version      3.8
 // @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
 // @grant        none
@@ -17,7 +17,9 @@
     const DEFAULT_CONFIG_VERSION = '2.3082.0';
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
-    const ASSISTANT_VERSION = 'v3.5';
+    const PAYMENT_DAYS_STORAGE_KEY = 'transCsvImportColleaguePaymentDays';
+    const ASSISTANT_VERSION = 'v3.8';
+    const GENERATED_CSV_IMPORT_EVENT = 'trans-csv-import-open-generated-file';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
     const DEFAULT_DUPLICATE_DELAY_INDEX = 0;
@@ -90,6 +92,24 @@
 
         if (overlay) overlay.style.display = 'flex';
         if (mini) mini.style.display = 'none';
+    }
+
+    async function openCsvImportAssistantWithFile(file) {
+        createAssistant();
+        showAssistant();
+
+        if (busy) {
+            setMessage('Import już trwa. Poczekaj na zakończenie albo użyj STOP.', 'warning');
+            return false;
+        }
+
+        if (!file) {
+            setMessage('Nie przekazano pliku CSV do importu.', 'warning');
+            return false;
+        }
+
+        await handleSelectedFile(file);
+        return true;
     }
 
     function normalizeMenuText(text) {
@@ -175,6 +195,25 @@
     if (window.top === window.self) {
         hookStandardCsvImportMenu();
     }
+
+    window.TransCsvImportAssistant = Object.assign({}, window.TransCsvImportAssistant, {
+        openWithFile: openCsvImportAssistantWithFile
+    });
+
+    window.addEventListener(GENERATED_CSV_IMPORT_EVENT, event => {
+        const detail = event.detail || {};
+        const file = detail.file || (
+            detail.csvText
+                ? new File([detail.csvText], detail.fileName || 'freight_import-generator-studio.csv', { type: 'text/csv;charset=utf-8' })
+                : null
+        );
+
+        openCsvImportAssistantWithFile(file).catch(error => {
+            console.error('[Trans CSV Import Assistant] Nie udało się otworzyć importu z pliku wygenerowanego:', error);
+            createAssistant();
+            setMessage(error.message || String(error), 'error');
+        });
+    });
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -510,7 +549,7 @@
         });
     }
 
-    async function publishImport(importUuid, employeeId) {
+    async function publishImport(importUuid, employeeId, paymentDays) {
         const payload = {
             time_zone: new Date().getTimezoneOffset(),
             with_duplicates: true,
@@ -518,7 +557,7 @@
                 contact_persons: [Number(employeeId)],
                 is_first_buy: false,
                 payment: {
-                    days: DEFAULT_PAYMENT_DAYS,
+                    days: paymentDays,
                     type: '1_deferred'
                 },
                 receivers: {
@@ -589,6 +628,37 @@
         const parsed = Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_DUPLICATE_COUNT;
 
         return Math.max(0, Math.min(MAX_DUPLICATE_COUNT, parsed || DEFAULT_DUPLICATE_COUNT));
+    }
+
+    function readPaymentDays() {
+        const input = document.getElementById('tcia-payment-days');
+        const rawValue = input ? String(input.value).trim() : String(DEFAULT_PAYMENT_DAYS);
+        const parsed = Number(rawValue);
+
+        return rawValue !== '' && Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+    }
+
+    function readSavedPaymentDays() {
+        try {
+            const rawValue = localStorage.getItem(PAYMENT_DAYS_STORAGE_KEY);
+            const parsed = Number(rawValue);
+
+            return rawValue !== null && rawValue.trim() !== '' && Number.isInteger(parsed) && parsed >= 0
+                ? parsed
+                : DEFAULT_PAYMENT_DAYS;
+        } catch (error) {
+            return DEFAULT_PAYMENT_DAYS;
+        }
+    }
+
+    function savePaymentDays(paymentDays) {
+        if (!Number.isInteger(paymentDays) || paymentDays < 0) return;
+
+        try {
+            localStorage.setItem(PAYMENT_DAYS_STORAGE_KEY, String(paymentDays));
+        } catch (error) {
+            console.warn('[Trans CSV Import Assistant] Nie udało się zapisać terminu płatności.', error);
+        }
     }
 
     function readDuplicateDelayIndex() {
@@ -988,7 +1058,7 @@
             });
         }
 
-        const published = await publishImport(importUuid, employeeId);
+        const published = await publishImport(importUuid, employeeId, task.paymentDays);
 
         if (stopImportRequested || tracker.stopRequested) {
             return {
@@ -1109,6 +1179,14 @@
             return;
         }
 
+        const paymentDays = readPaymentDays();
+        if (paymentDays === null) {
+            setStep('file');
+            setMessage('Podaj prawidłowy termin płatności: pełną liczbę dni, nie mniejszą niż 0.', 'warning');
+            return;
+        }
+        savePaymentDays(paymentDays);
+
         busy = true;
         stopImportRequested = false;
         lastQueueUiUpdateAt = 0;
@@ -1183,7 +1261,8 @@
                         runOffset,
                         publicationStartedAt,
                         availableAt: publicationStartedAt + ((runIndex - 1) * duplicateDelayMs),
-                        duplicateDelayMinutes
+                        duplicateDelayMinutes,
+                        paymentDays
                     });
                 }
             }
@@ -1192,8 +1271,8 @@
             currentImportTracker = tracker;
 
             setStep('publish');
-            setMessage(`Startuję import. Paczki po maks. ${CSV_CHUNK_SIZE} ofert, równolegle do ${IMPORT_QUEUE_MAX_ACTIVE} paczek.`, 'info');
-            setProgressNote(`Docelowo: ${plannedPublicationTotal} publikacji. ${duplicateText(duplicateCount)}. Odstęp duplikatów: ${formatDuplicateDelay(duplicateDelayMinutes)}.`);
+            setMessage(`Startuję import z terminem płatności ${paymentDays} dni. Paczki po maks. ${CSV_CHUNK_SIZE} ofert, równolegle do ${IMPORT_QUEUE_MAX_ACTIVE} paczek.`, 'info');
+            setProgressNote(`Docelowo: ${plannedPublicationTotal} publikacji. Termin płatności: ${paymentDays} dni. ${duplicateText(duplicateCount)}. Odstęp duplikatów: ${formatDuplicateDelay(duplicateDelayMinutes)}.`);
 
             const results = await runLimitedImportTasks(tasks, tracker);
 
@@ -1319,9 +1398,18 @@
                             <input id="tcia-delay-count" type="range" min="0" max="${DUPLICATE_DELAY_MINUTES.length - 1}" step="1" value="${DEFAULT_DUPLICATE_DELAY_INDEX}" />
                         </div>
                     </div>
-                    <div class="tcia-actions">
-                        <button id="tcia-stop" type="button" class="tcia-stop" disabled>STOP</button>
-                        <button id="tcia-run" type="button" class="tcia-primary">Importuj i opublikuj</button>
+                    <div class="tcia-action-column">
+                        <div class="tcia-payment-control">
+                            <label for="tcia-payment-days">Termin płatności</label>
+                            <div class="tcia-payment-input">
+                                <input id="tcia-payment-days" type="number" min="0" step="1" inputmode="numeric" value="${readSavedPaymentDays()}" />
+                                <span>dni</span>
+                            </div>
+                        </div>
+                        <div class="tcia-actions">
+                            <button id="tcia-stop" type="button" class="tcia-stop" disabled>STOP</button>
+                            <button id="tcia-run" type="button" class="tcia-primary">Importuj i opublikuj</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1605,9 +1693,57 @@
                 flex-direction: column;
                 gap: 10px;
             }
+            .tcia-payment-control {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 16px;
+                padding: 10px 16px;
+                border-radius: 14px;
+                background: #f4f7fb;
+                border: 1px solid #e5edf7;
+            }
+            .tcia-action-column {
+                display: flex;
+                flex-direction: column;
+                justify-content: flex-end;
+                gap: 10px;
+                min-width: 294px;
+            }
+            .tcia-payment-control label {
+                color: #10243d;
+                font-size: 13px;
+                font-weight: 800;
+            }
+            .tcia-payment-input {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                color: #65758b;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            #tcia-payment-days {
+                width: 74px;
+                box-sizing: border-box;
+                border: 1px solid #b8cbe0;
+                border-radius: 9px;
+                padding: 7px 9px;
+                background: #fff;
+                color: #10243d;
+                font: inherit;
+                font-weight: 800;
+                text-align: right;
+                outline: none;
+            }
+            #tcia-payment-days:focus {
+                border-color: #1b75bb;
+                box-shadow: 0 0 0 3px rgba(27, 117, 187, 0.14);
+            }
             .tcia-actions {
                 display: flex;
                 align-items: center;
+                justify-content: flex-end;
                 gap: 10px;
             }
             .tcia-duplicate-control {
@@ -1870,6 +2006,14 @@
             updateDuplicateDelayValue();
         }
 
+        const paymentDaysInput = document.getElementById('tcia-payment-days');
+        if (paymentDaysInput) {
+            paymentDaysInput.addEventListener('input', () => {
+                const paymentDays = readPaymentDays();
+                if (paymentDays !== null) savePaymentDays(paymentDays);
+            });
+        }
+
         dropzone.addEventListener('dragover', event => {
             event.preventDefault();
             dropzone.classList.add('is-dragover');
@@ -2116,12 +2260,14 @@
         const file = document.getElementById('tcia-file');
         const repeat = document.getElementById('tcia-repeat-count');
         const delay = document.getElementById('tcia-delay-count');
+        const paymentDays = document.getElementById('tcia-payment-days');
 
         if (run) run.disabled = busy;
         if (stop) stop.disabled = !busy || stopImportRequested;
         if (file) file.disabled = busy;
         if (repeat) repeat.disabled = busy;
         if (delay) delay.disabled = busy;
+        if (paymentDays) paymentDays.disabled = busy;
     }
 
     hookAuthCapture();
