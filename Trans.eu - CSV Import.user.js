@@ -2,7 +2,7 @@
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
 // @version      4.0
-// @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
+// @description  Otwiera asystenta importu CSV
 // @match        https://platform.trans.eu/*
 // @updateURL    https://raw.githubusercontent.com/Yazuor/CSV-Import/refs/heads/main/Trans.eu%20-%20CSV%20Import.user.js
 // @downloadURL  https://raw.githubusercontent.com/Yazuor/CSV-Import/refs/heads/main/Trans.eu%20-%20CSV%20Import.user.js
