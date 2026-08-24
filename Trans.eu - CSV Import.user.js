@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      3.9
+// @version      4.0
 // @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
+// @updateURL    https://raw.githubusercontent.com/Yazuor/CSV-Import/refs/heads/main/Trans.eu%20-%20CSV%20Import.user.js
+// @downloadURL  https://raw.githubusercontent.com/Yazuor/CSV-Import/refs/heads/main/Trans.eu%20-%20CSV%20Import.user.js
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -18,7 +20,11 @@
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
     const PAYMENT_DAYS_STORAGE_KEY = 'transCsvImportColleaguePaymentDays';
-    const ASSISTANT_VERSION = 'v3.9';
+    const SCRIPT_VERSION = '4.0';
+    const ASSISTANT_VERSION = `v${SCRIPT_VERSION}`;
+    const REMOTE_CONFIG_URL = 'https://raw.githubusercontent.com/Yazuor/CSV-Import/refs/heads/main/config.json';
+    const REMOTE_CONFIG_TIMEOUT = 5000;
+    const REMOTE_CONFIG_RUNTIME_CHECK_INTERVAL = 10 * 1000;
     const GENERATED_CSV_IMPORT_EVENT = 'trans-csv-import-open-generated-file';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
@@ -81,9 +87,16 @@
     let currentImportTracker = null;
     let currentImportAbortController = null;
     let lastMenuInterceptAt = 0;
+    let remoteConfigAllowed = true;
+    let remoteConfigLastCheckedAt = 0;
+    let remoteConfigCheckPromise = null;
+    let lastRemoteConfigMessage = '';
+    let lastRemoteVersionNotice = '';
 
-    function openCsvImportAssistantFromMenu() {
+    async function openCsvImportAssistantFromMenu() {
         createAssistant();
+        showAssistant();
+        await refreshRemoteConfigStatus(true);
     }
 
     function showAssistant() {
@@ -97,6 +110,11 @@
     async function openCsvImportAssistantWithFile(file) {
         createAssistant();
         showAssistant();
+
+        if (!await refreshRemoteConfigStatus(true)) {
+            showRemoteDisabledMessage();
+            return false;
+        }
 
         if (busy) {
             setMessage('Import już trwa. Poczekaj na zakończenie albo użyj STOP.', 'warning');
@@ -217,6 +235,134 @@
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function getVersionParts(version) {
+        const parts = String(version || '').match(/\d+/g);
+        return parts ? parts.map(Number) : [0];
+    }
+
+    function compareVersions(left, right) {
+        const leftParts = getVersionParts(left);
+        const rightParts = getVersionParts(right);
+        const maxLength = Math.max(leftParts.length, rightParts.length);
+
+        for (let index = 0; index < maxLength; index += 1) {
+            const difference = (leftParts[index] || 0) - (rightParts[index] || 0);
+            if (difference !== 0) return difference > 0 ? 1 : -1;
+        }
+
+        return 0;
+    }
+
+    function normalizeRemoteConfig(data) {
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('config.json musi być obiektem JSON');
+        }
+
+        return {
+            enabled: data.enabled !== false,
+            latestVersion: String(data.latestVersion || '').trim(),
+            message: String(data.message || '').trim()
+        };
+    }
+
+    function getRemoteConfigUrl() {
+        const separator = REMOTE_CONFIG_URL.includes('?') ? '&' : '?';
+        return `${REMOTE_CONFIG_URL}${separator}t=${Date.now()}`;
+    }
+
+    async function fetchRemoteConfig() {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timeout = controller ? setTimeout(() => controller.abort(), REMOTE_CONFIG_TIMEOUT) : null;
+
+        try {
+            const response = await fetch(getRemoteConfigUrl(), {
+                cache: 'no-store',
+                headers: { Accept: 'application/json' },
+                signal: controller ? controller.signal : undefined
+            });
+
+            if (!response.ok) throw new Error(`GitHub zwrócił HTTP ${response.status}`);
+            return normalizeRemoteConfig(JSON.parse(await response.text()));
+        } catch (error) {
+            const reason = error && error.name === 'AbortError'
+                ? `timeout po ${REMOTE_CONFIG_TIMEOUT / 1000} s`
+                : error && error.message ? error.message : String(error);
+            console.warn(`[Trans CSV Import Assistant] Nie udało się sprawdzić zdalnej konfiguracji (${reason}) - zachowuję ostatni stan.`);
+            return null;
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
+    }
+
+    function remoteDisabledText() {
+        return lastRemoteConfigMessage
+            ? `Importer został zdalnie wyłączony. ${lastRemoteConfigMessage}`
+            : 'Importer został zdalnie wyłączony przez administratora.';
+    }
+
+    function showRemoteDisabledMessage() {
+        setStep('file');
+        setMessage(remoteDisabledText(), 'error');
+        setProgressNote('Publikacja jest zablokowana zdalnie.');
+        updateBusy();
+    }
+
+    function applyRemoteConfig(config) {
+        if (!config) return remoteConfigAllowed;
+
+        const wasAllowed = remoteConfigAllowed;
+        lastRemoteConfigMessage = config.message;
+        remoteConfigAllowed = config.enabled !== false;
+
+        if (config.latestVersion && compareVersions(config.latestVersion, SCRIPT_VERSION) > 0) {
+            if (lastRemoteVersionNotice !== config.latestVersion) {
+                console.warn(`[Trans CSV Import Assistant] Dostępna jest wersja ${config.latestVersion}; zainstalowana: ${SCRIPT_VERSION}.`);
+                lastRemoteVersionNotice = config.latestVersion;
+            }
+        } else {
+            lastRemoteVersionNotice = '';
+        }
+
+        if (!remoteConfigAllowed) {
+            if (busy && !stopImportRequested) requestStopImport();
+            if (document.getElementById('tcia-overlay')) showRemoteDisabledMessage();
+        } else if (!wasAllowed && document.getElementById('tcia-overlay')) {
+            setMessage('Importer został ponownie włączony. Możesz rozpocząć nowy import.', 'success');
+            setProgressNote('');
+            updateBusy();
+        }
+
+        return remoteConfigAllowed;
+    }
+
+    async function refreshRemoteConfigStatus(force = false) {
+        const now = Date.now();
+        if (!force && now - remoteConfigLastCheckedAt < REMOTE_CONFIG_RUNTIME_CHECK_INTERVAL) {
+            return remoteConfigAllowed;
+        }
+        if (remoteConfigCheckPromise) return remoteConfigCheckPromise;
+
+        remoteConfigLastCheckedAt = now;
+        remoteConfigCheckPromise = fetchRemoteConfig()
+            .then(config => applyRemoteConfig(config))
+            .finally(() => {
+                remoteConfigCheckPromise = null;
+            });
+
+        return remoteConfigCheckPromise;
+    }
+
+    function startRemoteConfigChecks() {
+        refreshRemoteConfigStatus(true).catch(error => {
+            console.warn('[Trans CSV Import Assistant] Błąd kontroli zdalnej konfiguracji:', error);
+        });
+        setInterval(() => {
+            refreshRemoteConfigStatus(true).catch(error => {
+                console.warn('[Trans CSV Import Assistant] Błąd okresowej kontroli zdalnej konfiguracji:', error);
+            });
+        }, REMOTE_CONFIG_RUNTIME_CHECK_INTERVAL);
     }
 
     function sleepOrStop(ms) {
@@ -1214,6 +1360,11 @@
     async function runImport() {
         if (busy) return;
 
+        if (!await refreshRemoteConfigStatus(true)) {
+            showRemoteDisabledMessage();
+            return;
+        }
+
         if (!selectedFile) {
             setStep('file');
             setMessage('Wybierz plik CSV do importu.', 'warning');
@@ -2097,6 +2248,11 @@
     }
 
     async function handleSelectedFile(file) {
+        if (!remoteConfigAllowed) {
+            showRemoteDisabledMessage();
+            return;
+        }
+
         selectedFile = file || null;
         selectedFileValid = false;
         plannedPublicationTotal = 0;
@@ -2303,14 +2459,17 @@
         const delay = document.getElementById('tcia-delay-count');
         const paymentDays = document.getElementById('tcia-payment-days');
 
-        if (run) run.disabled = busy;
+        const controlsDisabled = busy || !remoteConfigAllowed;
+
+        if (run) run.disabled = controlsDisabled;
         if (stop) stop.disabled = !busy || stopImportRequested;
-        if (file) file.disabled = busy;
-        if (repeat) repeat.disabled = busy;
-        if (delay) delay.disabled = busy;
-        if (paymentDays) paymentDays.disabled = busy;
+        if (file) file.disabled = controlsDisabled;
+        if (repeat) repeat.disabled = controlsDisabled;
+        if (delay) delay.disabled = controlsDisabled;
+        if (paymentDays) paymentDays.disabled = controlsDisabled;
     }
 
     hookAuthCapture();
+    startRemoteConfigChecks();
 })();
 
