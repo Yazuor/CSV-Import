@@ -1513,8 +1513,12 @@
             setMessage(`Gotowe. Opublikowano ${totals.ok} frachtów. Importy: ${runCount} (${duplicateText(duplicateCount)}). Czas trwania publikacji ${formatDuration(Date.now() - publicationStartedAt)}.\nMożesz zamknąć okno importu. Plik miał ${chunkPlan.rowCount} ofert, łącznie przetworzono ${totals.total} wierszy.`, 'success');
             setProgressNote('');
         } catch (error) {
-            setStep(currentStep === 'publish' ? 'publish-error' : 'validation-error');
-            setMessage(error.message || String(error), 'error');
+            if (!remoteConfigAllowed) {
+                showRemoteDisabledMessage();
+            } else {
+                setStep(currentStep === 'publish' ? 'publish-error' : 'validation-error');
+                setMessage(error.message || String(error), 'error');
+            }
         } finally {
             busy = false;
             currentImportTracker = null;
@@ -2470,6 +2474,6 @@
     }
 
     hookAuthCapture();
-    startRemoteConfigChecks();
+    if (window.top === window.self) startRemoteConfigChecks();
 })();
 
