@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Trans.eu - CSV Import
 // @namespace    trans-direct-import-menu
-// @version      3.8
+// @version      3.9
 // @description  Otwiera asystenta importu CSV po kliknięciu w menu Trans.eu „Importuj frachty z CSV”
 // @match        https://platform.trans.eu/*
 // @grant        none
@@ -18,7 +18,7 @@
     const DEFAULT_APP_VERSION = '29.69.1';
     const DEFAULT_PAYMENT_DAYS = 55;
     const PAYMENT_DAYS_STORAGE_KEY = 'transCsvImportColleaguePaymentDays';
-    const ASSISTANT_VERSION = 'v3.8';
+    const ASSISTANT_VERSION = 'v3.9';
     const GENERATED_CSV_IMPORT_EVENT = 'trans-csv-import-open-generated-file';
     const DEFAULT_DUPLICATE_COUNT = 0;
     const MAX_DUPLICATE_COUNT = 15;
@@ -456,6 +456,40 @@
         return records;
     }
 
+    function parseTransCsvDate(value) {
+        const text = String(value || '').trim();
+        const match = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/);
+        if (!match) return null;
+
+        const day = Number(match[1]);
+        const month = Number(match[2]);
+        const year = Number(match[3]);
+        const hour = Number(match[4] || 0);
+        const minute = Number(match[5] || 0);
+        const parsed = new Date(year, month - 1, day, hour, minute, 0, 0);
+
+        return parsed.getFullYear() === year &&
+            parsed.getMonth() === month - 1 &&
+            parsed.getDate() === day &&
+            parsed.getHours() === hour &&
+            parsed.getMinutes() === minute
+            ? parsed
+            : null;
+    }
+
+    function findPastLoadingRows(records, headers, now = new Date()) {
+        const loadingDateIndex = headers.indexOf('Loading-date');
+        if (loadingDateIndex < 0) return [];
+
+        return records.slice(1).map((record, index) => {
+            const value = splitCsvLine(record)[loadingDateIndex] || '';
+            const parsed = parseTransCsvDate(value);
+            return parsed && parsed.getTime() <= now.getTime()
+                ? { csvRow: index + 2, value }
+                : null;
+        }).filter(Boolean);
+    }
+
     async function buildCsvChunks(file) {
         const text = (await file.text()).replace(/^\uFEFF/, '');
         const records = splitCsvRecords(text);
@@ -509,11 +543,9 @@
             };
         }
 
-        const preview = await file.slice(0, 12000).text();
-        const firstLine = preview
-            .replace(/^\uFEFF/, '')
-            .split(/\r?\n/)
-            .find(line => line.trim().length > 0) || '';
+        const text = (await file.text()).replace(/^\uFEFF/, '');
+        const records = splitCsvRecords(text);
+        const firstLine = records[0] || '';
         const headers = splitCsvLine(firstLine);
         const missing = REQUIRED_TRANS_HEADERS.filter(header => !headers.includes(header));
 
@@ -521,6 +553,15 @@
             return {
                 ok: false,
                 message: `To nie jest plik importu frachtów Trans.eu. Wybierz CSV wygenerowany do importu frachtów. Brakuje m.in.: ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '...' : ''}.`
+            };
+        }
+
+        const pastRows = findPastLoadingRows(records, headers);
+        if (pastRows.length > 0) {
+            const examples = pastRows.slice(0, 5).map(item => `wiersz ${item.csvRow}: ${item.value}`).join(', ');
+            return {
+                ok: false,
+                message: `Nie importuję pliku: ${pastRows.length} publikacji ma przeszłą datę załadunku (${examples}${pastRows.length > 5 ? ', ...' : ''}). Popraw daty przed importem.`
             };
         }
 
@@ -2272,3 +2313,4 @@
 
     hookAuthCapture();
 })();
+
